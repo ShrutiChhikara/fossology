@@ -104,3 +104,149 @@ the Free Software Foundation.
 results = retrieve_license(sample_input_4)
 for license_id, score in results:
     print(f"License: {license_id}, Cosine Similarity Score: {score:.4f}")
+
+
+
+# Install dependencies
+!pip install transformers sentence-transformers faiss-cpu requests tqdm deep-translator --quiet
+
+# Imports
+import requests
+import numpy as np
+import faiss
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from deep_translator import GoogleTranslator
+
+# Step 1: Load strong multilingual embedding model
+embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+
+# Step 2: Fetch SPDX license data
+url = "https://raw.githubusercontent.com/spdx/license-list-data/main/json/licenses.json"
+response = requests.get(url)
+data = response.json()
+
+license_texts = []
+license_ids = []
+
+for entry in tqdm(data["licenses"]):
+    license_id = entry["licenseId"]
+    if entry.get("isDeprecatedLicenseId", False):
+        continue
+
+    license_url = f"https://raw.githubusercontent.com/spdx/license-list-data/main/text/{license_id}.txt"
+    license_resp = requests.get(license_url)
+    if license_resp.status_code == 200:
+        license_text = license_resp.text.strip()
+        license_texts.append(license_text)
+        license_ids.append(license_id)
+
+# Step 3: Embed and index with FAISS
+embeddings = embedder.encode(license_texts, show_progress_bar=True, convert_to_numpy=True)
+embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+index = faiss.IndexFlatIP(embeddings.shape[1])
+index.add(embeddings)
+
+# Step 4: Define semantic retrieval function
+def retrieve_license(input_text, k=3, threshold=0.75):
+    embedding = embedder.encode([input_text], convert_to_numpy=True)
+    embedding = embedding / np.linalg.norm(embedding)
+
+    scores, indices = index.search(embedding, k)
+    results = []
+    for i in range(k):
+        score = float(scores[0][i])
+        if score >= threshold:
+            results.append((license_ids[indices[0][i]], score))
+    return results
+
+# Step 5: Load LLM for RAG-style response
+model_name = "google/flan-t5-large"
+rag_tokenizer = AutoTokenizer.from_pretrained(model_name)
+rag_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+text_generator = pipeline("text2text-generation", model=rag_model, tokenizer=rag_tokenizer)
+
+# Step 6: Translation (optional, language agnostic preprocessing)
+def translate_to_english(text):
+    try:
+        translated = GoogleTranslator(source='auto', target='en').translate(text)
+        return translated
+    except Exception as e:
+        print("Translation Error:", e)
+        return text
+
+# Step 7: RAG-style license explanation using LLM
+def rag_style_license_explanation(input_text, top_k=3, threshold=0.75, translate=True):
+    original_input = input_text.strip()
+    if translate:
+        input_text = translate_to_english(original_input)
+
+    retrieved = retrieve_license(input_text, k=top_k, threshold=threshold)
+
+    if not retrieved:
+        print("No confident matches found.:(")
+        return
+
+    # Build context
+    context = "\n".join(
+        f"{i+1}. {lic_id}:\n{license_texts[license_ids.index(lic_id)][:500]}...\n"
+        for i, (lic_id, _) in enumerate(retrieved)
+    )
+
+    prompt = f"""
+Given the following license texts:
+
+{context}
+
+Which license best matches the following input?
+
+Input:
+{input_text}
+
+Explain why and name the best matching license.
+""".strip()
+
+    output = text_generator(prompt, max_length=512, do_sample=False)[0]['generated_text']
+
+    print("🔍 Original Input:\n", original_input)
+    print("\n Translated Input:\n", input_text)
+    print("\n Retrieved Context:\n", context)
+    print("\n Model Response:\n", output)
+    print("\n Top Matches (with score):")
+    for lic_id, score in retrieved:
+        print(f"  - {lic_id}: {score:.4f}")
+
+# Step 8: Test with an input
+sample_input = """
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files...
+"""
+
+rag_style_license_explanation(sample_input)
+
+rag_style_license_explanation("""
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+""")
+
+rag_style_license_explanation("""
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation.
+""")
+
+rag_style_license_explanation("""
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+""")
+
+rag_style_license_explanation("""
+You are free to: Share — copy and redistribute the material in any medium or format. Adapt — remix, transform, and build upon the material for any purpose, even commercially.
+""")
+
+rag_style_license_explanation("""
+Ce logiciel est fourni tel quel, sans aucune garantie, expresse ou implicite, y compris mais sans s'y limiter aux garanties de qualité marchande.
+""")
+
+rag_style_license_explanation("""
+Se concede permiso, sin cargo, a cualquier persona que obtenga una copia de este software y los archivos de documentación asociados...
+""")
